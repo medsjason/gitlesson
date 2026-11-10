@@ -1,0 +1,141 @@
+name: One-off OpenAlex EV battery joining systematic search
+on:
+  push:
+    branches:
+      - research/openalex-ev-joining-2026
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Execute eight documented searches and archive raw responses
+        shell: bash
+        run: |
+          cat > run_search.py <<'PY'
+          import urllib.request, urllib.parse, urllib.error, json, csv, os, re, gzip, time, datetime, hashlib, unicodedata
+          from collections import defaultdict
+          os.makedirs('results/raw',exist_ok=True)
+          URL='https://api.openalex.org/works'
+          CUTOFF='2026-11-10'
+          searches=[
+          ('OA01','Conductive battery joining core','(battery OR "lithium-ion" OR "electric vehicle") AND (welding OR joining OR interconnection) AND (tab OR busbar OR "current collector")'),
+          ('OA02','Specific welding mechanisms and connectors','(battery OR "lithium-ion") AND ("laser welding" OR "ultrasonic welding" OR "resistance welding") AND (foil OR terminal OR connector)'),
+          ('OA03','Electricity, auxiliary systems and consumables - RQ1','(battery OR "lithium-ion") AND (welding OR joining) AND (electricity OR "energy consumption" OR "shielding gas" OR argon OR "power input")'),
+          ('OA04','Electrical and thermal equivalence - RQ2','(battery OR "electric vehicle") AND (welding OR joining OR interconnection) AND ("contact resistance" OR "electrical resistance" OR "temperature rise")'),
+          ('OA05','Defects, quality, scrap and yield - RQ3','(battery OR "lithium-ion") AND (welding OR joining) AND (defect OR quality OR rework OR scrap OR yield)'),
+          ('OA06','Environmental assessment context - RQ4','(battery OR "electric vehicle") AND (joining OR welding) AND ("life cycle assessment" OR "life cycle inventory" OR "environmental impact")'),
+          ('OA07','Non-fusion alternative joining','(battery OR "lithium-ion") AND ("joining by forming" OR "electromagnetic pulse welding" OR "friction stir welding" OR "mechanical fastening")'),
+          ('OA08','Connector nomenclature sensitivity','(battery OR "lithium-ion") AND ("battery-to-tab" OR "tab-to-busbar" OR "foil-to-tab" OR "cell terminal") AND (welding OR joining OR interconnection)')]
+          fields='id,doi,title,publication_year,publication_date,type,language,authorships,primary_location,abstract_inverted_index,open_access'
+          def now():return datetime.datetime.now(datetime.timezone.utc).isoformat()
+          def abstract(index):
+            if not index: return ''
+            z=[(p,w) for w,ps in index.items() for p in ps if isinstance(p,int) and p>=0]
+            z.sort()
+            return ' '.join(w for p,w in z)
+          def doi_norm(doi):
+            return re.sub(r'^https?://(?:dx\.)?doi\.org/','',(doi or '').strip().lower()).strip()
+          def get(url):
+            last=''
+            for retry in range(6):
+              try:
+                req=urllib.request.Request(url,headers={'User-Agent':'EVBatteryJoiningLiteratureReview/1.0 (public scholarly query)','Accept':'application/json'})
+                with urllib.request.urlopen(req, timeout=75) as r:
+                  raw=r.read()
+                  if r.status!=200:raise ValueError('HTTP '+str(r.status))
+                  return json.loads(raw),raw
+              except Exception as ex:
+                last=str(ex); print('ERROR',last,'retry',retry,flush=True)
+                if retry<5:time.sleep(min(32,2**retry))
+            raise RuntimeError(last)
+          def write_csv(name,rows,keys):
+            with open('results/'+name,'w',newline='',encoding='utf-8-sig') as f:
+              w=csv.DictWriter(f,fieldnames=keys,extrasaction='ignore');w.writeheader();w.writerows(rows)
+          started=now(); allhits=[]; logs=[]; fatal=[]
+          for qid,label,expression in searches:
+            count=None; hits=0; pages=0; errors=[]; oql=''
+            print('START',qid,expression,flush=True)
+            for page in range(1,101):
+              params={'search.title_and_abstract':expression,'filter':'to_publication_date:'+CUTOFF,'per-page':'100','page':str(page),'select':fields}
+              url=URL+'?'+urllib.parse.urlencode(params)
+              try: data,raw=get(url)
+              except Exception as ex:
+                errors.append('Page '+str(page)+': '+str(ex));break
+              meta=data.get('meta',{})
+              if count is None:count=meta.get('count')
+              if isinstance(meta.get('x_query'),dict):oql=meta['x_query'].get('oql','')
+              records=data.get('results',[])
+              pages+=1; hits+=len(records)
+              with gzip.open('results/raw/'+qid+'_page_'+str(page).zfill(3)+'.json.gz','wb') as f:
+                f.write(json.dumps({'retrieved_at_utc':now(),'request_url':url,'response':data},ensure_ascii=False).encode('utf-8'))
+              for w in records:
+                aid=(w.get('id') or '').rsplit('/',1)[-1]; d=doi_norm(w.get('doi'))
+                names=[(a.get('author') or {}).get('display_name','') for a in (w.get('authorships') or [])]
+                r={'openalex_id':aid,'doi':d,'title':w.get('title') or '', 'year':w.get('publication_year') or '',
+                  'publication_date':w.get('publication_date') or '', 'document_type':w.get('type') or '',
+                  'language':w.get('language') or '', 'authors':'; '.join(x for x in names if x),
+                  'source':((w.get('primary_location') or {}).get('source') or {}).get('display_name') or '',
+                  'abstract':abstract(w.get('abstract_inverted_index')),
+                  'source_url':w.get('id') or '', 'doi_url':'https://doi.org/'+d if d else '',
+                  'open_access':str((w.get('open_access') or {}).get('is_oa','')).lower(), 'search_arm':qid}
+                allhits.append(r)
+              print('PAGE',qid,page,'hits',hits,'of',count,flush=True)
+              if not records or (count is not None and hits>=count):break
+              time.sleep(.18)
+            complete=bool(count is not None and hits>=count and not errors)
+            if not complete: fatal.append(qid)
+            logs.append({'search_id':qid,'purpose':label,'database':'OpenAlex Works API','field':'title and abstract',
+               'exact_expression':expression,'literature_cutoff':CUTOFF,'execution_started_utc':started,
+               'execution_finished_utc':now(),'openalex_reported_count':count if count is not None else '',
+               'downloaded_hits':hits,'pages_downloaded':pages,'complete':'YES' if complete else 'NO',
+               'error':' | '.join(errors),'response_oql':oql})
+          fieldsout=['openalex_id','doi','title','year','publication_date','document_type','language','authors','source','abstract','source_url','doi_url','open_access','search_arm']
+          write_csv('all_query_hits.csv',allhits,fieldsout)
+          write_csv('search_execution_log.csv',logs,list(logs[0]))
+          unique={};arms=defaultdict(set)
+          for r in allhits:
+            key=('doi:'+r['doi']) if r['doi'] else ('openalex:'+r['openalex_id'])
+            if key not in unique:unique[key]=dict(r)
+            elif len(r['abstract'])>len(unique[key]['abstract']): unique[key]=dict(r)
+            arms[key].add(r['search_arm'])
+          recs=list(unique.values())
+          for r in recs:
+            key=('doi:'+r['doi']) if r['doi'] else ('openalex:'+r['openalex_id'])
+            r['matching_arms']=';'.join(sorted(arms[key]))
+            r['title_abstract_screening']='NOT STARTED';r['full_text_assessment']='NOT STARTED'
+            r['independent_reviewer']='';r['final_inclusion_decision']=''
+          recs.sort(key=lambda r:(str(r['year']),r['title'].lower()),reverse=True)
+          ufields=fieldsout+['matching_arms','title_abstract_screening','full_text_assessment','independent_reviewer','final_inclusion_decision']
+          write_csv('unique_unscreened_records.csv',recs,ufields)
+          with open('results/unique_unscreened_records.ris','w',encoding='utf-8') as f:
+            for r in recs:
+              f.write('TY  - '+('CONF' if 'proceedings' in r['document_type'] else 'JOUR')+'\n')
+              for code,key in [('TI','title'),('PY','year'),('JO','source'),('DO','doi'),('UR','doi_url'),('AB','abstract')]:
+                if r[key]:f.write(code+'  - '+str(r[key]).replace('\n',' ').replace('\r',' ')+'\n')
+              for a in r['authors'].split('; '):
+                if a:f.write('AU  - '+a+'\n')
+              f.write('N1  - OpenAlex ID '+r['openalex_id']+'; query arms '+r['matching_arms']+'\nER  - \n\n')
+          summary={'database':'OpenAlex','search_date_utc':started,'search_completed_utc':now(),
+            'literature_cutoff':CUTOFF,'search_arms':len(searches),'completed_arms':sum(x['complete']=='YES' for x in logs),
+            'all_arms_complete':not fatal,'search_hits_before_deduplication':len(allhits),
+            'duplicates_across_search_arms':len(allhits)-len(recs),
+            'unique_unscreened_records':len(recs),
+            'unique_with_abstract':sum(bool(x['abstract']) for x in recs),
+            'unique_without_abstract':sum(not bool(x['abstract']) for x in recs),
+            'failed_arms':fatal, 'included_studies':None,'second_reviewer_agreement':None,
+            'methodological_warning':'Unscreened identification results only; no report/full-text eligibility or independent co-author review completed.'}
+          with open('results/search_summary.json','w') as f:json.dump(summary,f,indent=2)
+          print('FINAL_SUMMARY',json.dumps(summary),flush=True)
+          if fatal:open('results/INCOMPLETE_NOTICE.txt','w').write('At least one search arm did not complete; no final identification total should be claimed.')
+          PY
+          python3 run_search.py
+      - name: Archive raw JSON and searchable records
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: openalex-ev-joining-research-2026
+          path: results/
+          retention-days: 30
